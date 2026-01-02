@@ -6,49 +6,59 @@
 </head>
 
 <body style="font-family:system-ui;padding:12px">
-  <h3>Tarot camera → n8n</h3>
+  <h3>Tarot: «карты говорите» → вопрос → 5 кадров → ответ</h3>
 
   <video id="v" autoplay playsinline
     style="width:100%;max-width:520px;border:1px solid #ccc;border-radius:12px"></video>
 
-  <div style="margin:12px 0">
+  <div style="margin:12px 0; display:flex; gap:10px; flex-wrap:wrap; align-items:center">
     <button id="start">Start</button>
     <button id="stop">Stop</button>
 
-    <label style="margin-left:12px">Interval (ms):
-      <input id="ms" type="number" value="1500" min="300" step="100" style="width:90px">
+    <label>Interval (sec):
+      <input id="sec" type="number" value="3" min="1" step="1" style="width:60px">
     </label>
+
+    <label>Frames:
+      <input id="count" type="number" value="5" min="1" max="10" step="1" style="width:60px">
+    </label>
+  </div>
+
+  <div style="margin:12px 0">
+    <div><b>🎧 Voice:</b> <span id="mic" style="opacity:.8"></span></div>
+    <div style="margin-top:8px"><b>❓ Question:</b></div>
+    <div id="q" style="white-space:pre-wrap;background:#eef;padding:10px;border-radius:10px;min-height:36px"></div>
+
+    <div style="margin-top:10px"><b>📷 Capture:</b> <span id="cap" style="opacity:.8"></span></div>
   </div>
 
   <pre id="out" style="white-space:pre-wrap;background:#f6f6f6;padding:10px;border-radius:10px"></pre>
 
-  <div style="margin:12px 0">
-    <b>🎧 Voice question:</b>
-    <div id="q" style="white-space:pre-wrap;background:#eef;padding:10px;border-radius:10px;min-height:40px"></div>
-    <div id="mic" style="opacity:.7;margin-top:6px"></div>
-  </div>
-
 <script>
 const WEBHOOK_URL = "https://dinodi.app.n8n.cloud/webhook/06663b29-629e-409b-bf14-104d6d419d32";
 
-let timer = null;
+const WAKE_PHRASE = "карты говорите";
+const SILENCE_MS = 3000;
+
 let stream = null;
 
-// ===== VOICE → QUESTION (wake phrase) =====
-const WAKE_PHRASE = "карты говорите";
 let captureMode = false;
 let capturedText = "";
 let silenceTimer = null;
 
-// чтобы можно было остановить распознавание
+let isBusy = false;
 let rec = null;
 let manualStopSpeech = false;
 
-const qEl = document.getElementById("q");
 const micEl = document.getElementById("mic");
+const qEl = document.getElementById("q");
+const outEl = document.getElementById("out");
+const capEl = document.getElementById("cap");
 
-function setMicStatus(t){ micEl.textContent = t; }
-function setQuestionPreview(t){ qEl.textContent = t || ""; }
+function setMic(t){ micEl.textContent = t; }
+function setQ(t){ qEl.textContent = t || ""; }
+function setCap(t){ capEl.textContent = t || ""; }
+function log(t){ outEl.textContent = t; }
 
 function normalizeRu(s){
   return (s || "")
@@ -59,119 +69,12 @@ function normalizeRu(s){
     .trim();
 }
 
-const WAKE_NORM = normalizeRu(WAKE_PHRASE);
-
-// ⏱ фиксируем вопрос после 3 секунд тишины
-function armSilenceCommit(){
-  clearTimeout(silenceTimer);
-  silenceTimer = setTimeout(async () => {
-    const finalQ = capturedText.trim();
-
-    if (captureMode && finalQ.length > 2) {
-      captureMode = false;
-      capturedText = "";
-
-      setMicStatus("✅ Вопрос зафиксирован. Отправляю…");
-      setQuestionPreview(finalQ);
-
-      await sendFrameWithQuestion(finalQ);
-
-      setTimeout(() => setMicStatus("🎧 Слушаю… скажи: «карты говорите»"), 1200);
-      return;
-    }
-
-    // если тишина наступила, но вопрос пустой — сбрасываем режим
-    captureMode = false;
-    capturedText = "";
-    setQuestionPreview("");
-    setMicStatus("🎧 Слушаю… скажи: «карты говорите»");
-  }, 3000);
-}
-
-function startSpeech(){
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) {
-    setMicStatus("❌ SpeechRecognition не поддерживается (лучше Chrome на ноутбуке).");
-    return;
-  }
-
-  // если уже запущено — не запускаем второй раз
-  if (rec) return;
-
-  manualStopSpeech = false;
-  rec = new SR();
-  rec.lang = "ru-RU";
-  rec.continuous = true;
-  rec.interimResults = true;
-
-  rec.onstart = () => setMicStatus("🎧 Слушаю… скажи: «карты говорите»");
-
-  rec.onresult = (e) => {
-    let finalText = "";
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      if (e.results[i].isFinal) finalText += e.results[i][0].transcript + " ";
-    }
-    if (!finalText.trim()) return;
-
-    const norm = normalizeRu(finalText);
-
-    // ждём кодовую фразу
-    if (!captureMode && norm.includes(WAKE_NORM)) {
-      captureMode = true;
-
-      // возьмём хвост после кодовой фразы (если сразу сказала вопрос)
-      const idx = norm.indexOf(WAKE_NORM);
-      const after = norm.slice(idx + WAKE_NORM.length).trim();
-      capturedText = after ? after : "";
-
-      setMicStatus("🎙️ Говори вопрос… (замолчи на 3 секунды — отправлю)");
-      setQuestionPreview(capturedText);
-
-      armSilenceCommit();
-      return;
-    }
-
-    // если в режиме вопроса — копим текст
-    if (captureMode) {
-      capturedText += (capturedText ? " " : "") + finalText.trim();
-      setQuestionPreview(capturedText);
-      armSilenceCommit();
-    }
-  };
-
-  rec.onend = () => {
-    // авто-перезапуск, но только если мы сами не остановили
-    if (!manualStopSpeech) {
-      setTimeout(() => { try { rec.start(); } catch(e) {} }, 400);
-    }
-  };
-
-  rec.onerror = (e) => {
-    setMicStatus("⚠️ Ошибка распознавания: " + (e.error || "unknown"));
-  };
-
-  try { rec.start(); } catch(e) {}
-}
-
-function stopSpeech(){
-  manualStopSpeech = true;
-  try { if (rec) rec.stop(); } catch(e) {}
-  rec = null;
-
-  captureMode = false;
-  capturedText = "";
-  clearTimeout(silenceTimer);
-  setQuestionPreview("");
-  setMicStatus("");
-}
-
-// ===== CAMERA =====
 async function startCam(){
   stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: { ideal: "environment" } },
     audio: false
   });
-  document.getElementById('v').srcObject = stream;
+  document.getElementById("v").srcObject = stream;
 }
 
 function stopCam(){
@@ -180,76 +83,161 @@ function stopCam(){
 }
 
 async function getFrameBlob(){
-  const video = document.getElementById('v');
+  const video = document.getElementById("v");
   if (!video.videoWidth || !video.videoHeight) return null;
 
-  const canvas = document.createElement('canvas');
+  const canvas = document.createElement("canvas");
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
-  canvas.getContext('2d').drawImage(video, 0, 0);
+  canvas.getContext("2d").drawImage(video, 0, 0);
 
-  return await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.85));
+  return await new Promise(r => canvas.toBlob(r, "image/jpeg", 0.85));
 }
 
-// отправка кадра (стрим)
-async function sendFrame(){
-  const blob = await getFrameBlob();
-  if (!blob) return;
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-  const fd = new FormData();
-  fd.append('image', blob, 'frame.jpg');
+async function captureNFramesAndSend(question){
+  const sec = Math.max(1, Number(document.getElementById("sec").value || 3));
+  const count = Math.min(10, Math.max(1, Number(document.getElementById("count").value || 5)));
 
-  try{
-    const res = await fetch(WEBHOOK_URL, { method: 'POST', body: fd });
-    const text = await res.text();
-    document.getElementById('out').textContent =
-      `Sent frame: ${new Date().toLocaleTimeString()}\nResponse:\n${text}`;
-  } catch(e){
-    document.getElementById('out').textContent = `❌ sendFrame error: ${String(e)}`;
+  setCap(`Готовлю ${count} кадров (каждые ${sec} сек)…`);
+  const frames = [];
+
+  for (let i = 1; i <= count; i++){
+    setCap(`Снимаю кадр ${i}/${count}…`);
+    const blob = await getFrameBlob();
+    if (blob) frames.push({ idx: i, blob });
+    await sleep(sec * 1000);
   }
+
+  setCap(`Отправляю ${frames.length}/${count} кадров и вопрос…`);
+  const fd = new FormData();
+  fd.append("question", question);
+
+  // прикрепляем 5 файлов: image1..image5
+  frames.forEach(f => fd.append(`image${f.idx}`, f.blob, `frame${f.idx}.jpg`));
+
+  const res = await fetch(WEBHOOK_URL, { method: "POST", body: fd });
+  const text = await res.text();
+
+  log(`✅ Отправлено.\n\n❓ ${question}\n\nОтвет:\n${text}`);
+  setCap("✅ Готово. Можно снова: «карты говорите»");
 }
 
-// отправка кадра + вопрос
-async function sendFrameWithQuestion(question){
-  const blob = await getFrameBlob();
-  if (!blob) {
-    document.getElementById('out').textContent = "❌ Камера ещё не дала кадр. Подожди 1–2 секунды после Start.";
+function armSilenceCommit(){
+  clearTimeout(silenceTimer);
+  silenceTimer = setTimeout(async () => {
+    if (!captureMode || isBusy) return;
+
+    const finalQ = capturedText.trim();
+    if (finalQ.length < 2){
+      captureMode = false;
+      capturedText = "";
+      setQ("");
+      setMic("⚠️ Вопрос слишком короткий. Повтори: «карты говорите» и вопрос.");
+      return;
+    }
+
+    captureMode = false;
+    capturedText = "";
+    setQ(finalQ);
+
+    isBusy = true;
+    setMic("✅ Вопрос зафиксирован. Сейчас сниму 5 кадров…");
+    log("⏳ Жду кадры… держи карты в кадре стабильно.");
+    try{
+      await captureNFramesAndSend(finalQ);
+    } catch(e){
+      log("❌ Ошибка: " + (e?.message || e));
+      setCap("❌ Ошибка отправки.");
+    }
+    isBusy = false;
+    setMic("🎧 Слушаю… скажи: «карты говорите»");
+  }, SILENCE_MS);
+}
+
+function startSpeech(){
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR){
+    setMic("❌ SpeechRecognition не поддерживается (лучше Chrome).");
     return;
   }
+  if (rec) return;
 
-  const fd = new FormData();
-  fd.append('image', blob, 'frame.jpg');
-  fd.append('question', question);
+  manualStopSpeech = false;
+  rec = new SR();
+  rec.lang = "ru-RU";
+  rec.continuous = true;
+  rec.interimResults = true;
 
-  try{
-    const res = await fetch(WEBHOOK_URL, { method: 'POST', body: fd });
-    const text = await res.text();
-    document.getElementById('out').textContent =
-      `🎙 Question sent: ${question}\nResponse:\n${text}`;
-  } catch(e){
-    document.getElementById('out').textContent = `❌ sendFrameWithQuestion error: ${String(e)}`;
-  }
+  rec.onstart = () => setMic("🎧 Слушаю… скажи: «карты говорите»");
+
+  rec.onresult = (e) => {
+    if (isBusy) return; // пока снимаем кадры — игнорируем голос
+
+    let finalText = "";
+    for (let i = e.resultIndex; i < e.results.length; i++){
+      if (e.results[i].isFinal) finalText += e.results[i][0].transcript + " ";
+    }
+    if (!finalText.trim()) return;
+
+    const norm = normalizeRu(finalText);
+    const wakeNorm = normalizeRu(WAKE_PHRASE);
+
+    // Включаем режим захвата вопроса только после кодовой фразы
+    if (!captureMode && norm.includes(wakeNorm)){
+      captureMode = true;
+
+      // хвост после «карты говорите» (если в той же фразе есть вопрос)
+      const idx = norm.indexOf(wakeNorm);
+      const after = norm.slice(idx + wakeNorm.length).trim();
+      capturedText = after ? after : "";
+
+      setMic("🎙️ Задай вопрос… (замолчи на 3 сек — зафиксирую)");
+      setQ(capturedText);
+      armSilenceCommit();
+      return;
+    }
+
+    // Если уже в режиме захвата — дописываем вопрос
+    if (captureMode){
+      capturedText += (capturedText ? " " : "") + finalText.trim();
+      setQ(capturedText);
+      armSilenceCommit();
+    }
+  };
+
+  rec.onend = () => {
+    if (!manualStopSpeech) setTimeout(() => { try{ rec.start(); } catch(_){} }, 400);
+  };
+
+  rec.onerror = () => {};
+  try{ rec.start(); } catch(_){}
 }
 
-// ===== UI buttons =====
-document.getElementById('start').onclick = async () => {
+function stopSpeech(){
+  manualStopSpeech = true;
+  try { if (rec) rec.stop(); } catch(_){}
+  rec = null;
+}
+
+document.getElementById("start").onclick = async () => {
   await startCam();
-
-  // запускаем микрофон по клику (так надежнее для браузеров)
   startSpeech();
-
-  const ms = Number(document.getElementById('ms').value || 1500);
-  clearInterval(timer);
-  timer = setInterval(sendFrame, ms);
-
-  document.getElementById('out').textContent = "Streaming frames…";
+  setCap("⏸ Ожидаю вопрос…");
+  log("✅ Готово. Скажи: «карты говорите», затем вопрос.");
 };
 
-document.getElementById('stop').onclick = () => {
-  clearInterval(timer);
-  stopCam();
+document.getElementById("stop").onclick = () => {
+  clearTimeout(silenceTimer);
+  captureMode = false;
+  capturedText = "";
+  setQ("");
+  setCap("⏹ Остановлено.");
+  setMic("");
   stopSpeech();
-  document.getElementById('out').textContent = "Stopped.";
+  stopCam();
+  log("Stopped.");
 };
 </script>
 
