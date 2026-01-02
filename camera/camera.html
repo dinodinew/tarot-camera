@@ -1,0 +1,62 @@
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body style="font-family:system-ui;padding:12px">
+  <h3>Tarot camera → n8n</h3>
+  <video id="v" autoplay playsinline style="width:100%;max-width:520px;border:1px solid #ccc;border-radius:12px"></video>
+  <div style="margin:12px 0">
+    <button id="start">Start</button>
+    <button id="stop">Stop</button>
+    <label style="margin-left:12px">Interval (ms):
+      <input id="ms" type="number" value="1500" min="300" step="100" style="width:90px">
+    </label>
+  </div>
+  <pre id="out" style="white-space:pre-wrap;background:#f6f6f6;padding:10px;border-radius:10px"></pre>
+
+<script>
+const WEBHOOK_URL = "PASTE_TEST_URL_HERE"; // вставь сюда твой Test URL из n8n
+let timer, stream;
+
+async function startCam(){
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: "environment" } }, audio: false
+  });
+  document.getElementById('v').srcObject = stream;
+}
+
+async function sendFrame(){
+  const video = document.getElementById('v');
+  if (!video.videoWidth) return;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  canvas.getContext('2d').drawImage(video, 0, 0);
+
+  const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.85));
+  const fd = new FormData();
+  fd.append('image', blob, 'frame.jpg'); // важно: image совпадает с Field Name for Binary Data
+
+  const res = await fetch(WEBHOOK_URL, { method: 'POST', body: fd });
+  const text = await res.text();
+  document.getElementById('out').textContent = `Sent frame: ${new Date().toLocaleTimeString()}\nResponse:\n${text}`;
+}
+
+document.getElementById('start').onclick = async () => {
+  await startCam();
+  const ms = Number(document.getElementById('ms').value || 1500);
+  clearInterval(timer);
+  timer = setInterval(sendFrame, ms);
+  document.getElementById('out').textContent = "Streaming frames…";
+};
+
+document.getElementById('stop').onclick = () => {
+  clearInterval(timer);
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  document.getElementById('out').textContent = "Stopped.";
+};
+</script>
+</body>
+</html>
