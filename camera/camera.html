@@ -1,62 +1,257 @@
 <!doctype html>
-<html>
+<html lang="ru">
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="utf-8">
 </head>
+
 <body style="font-family:system-ui;padding:12px">
   <h3>Tarot camera → n8n</h3>
-  <video id="v" autoplay playsinline style="width:100%;max-width:520px;border:1px solid #ccc;border-radius:12px"></video>
+
+  <video id="v" autoplay playsinline
+    style="width:100%;max-width:520px;border:1px solid #ccc;border-radius:12px"></video>
+
   <div style="margin:12px 0">
     <button id="start">Start</button>
     <button id="stop">Stop</button>
+
     <label style="margin-left:12px">Interval (ms):
       <input id="ms" type="number" value="1500" min="300" step="100" style="width:90px">
     </label>
   </div>
+
   <pre id="out" style="white-space:pre-wrap;background:#f6f6f6;padding:10px;border-radius:10px"></pre>
 
-<script>
-const WEBHOOK_URL = "https://dinodi.app.n8n.cloud/webhook/06663b29-629e-409b-bf14-104d6d419d32"; // вставь сюда твой Test URL из n8n
-let timer, stream;
+  <div style="margin:12px 0">
+    <b>🎧 Voice question:</b>
+    <div id="q" style="white-space:pre-wrap;background:#eef;padding:10px;border-radius:10px;min-height:40px"></div>
+    <div id="mic" style="opacity:.7;margin-top:6px"></div>
+  </div>
 
+<script>
+const WEBHOOK_URL = "https://dinodi.app.n8n.cloud/webhook/06663b29-629e-409b-bf14-104d6d419d32";
+
+let timer = null;
+let stream = null;
+
+// ===== VOICE → QUESTION (wake phrase) =====
+const WAKE_PHRASE = "карты говорите";
+let captureMode = false;
+let capturedText = "";
+let silenceTimer = null;
+
+// чтобы можно было остановить распознавание
+let rec = null;
+let manualStopSpeech = false;
+
+const qEl = document.getElementById("q");
+const micEl = document.getElementById("mic");
+
+function setMicStatus(t){ micEl.textContent = t; }
+function setQuestionPreview(t){ qEl.textContent = t || ""; }
+
+function normalizeRu(s){
+  return (s || "")
+    .toLowerCase()
+    .replace(/ё/g, "е")
+    .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const WAKE_NORM = normalizeRu(WAKE_PHRASE);
+
+// ⏱ фиксируем вопрос после 3 секунд тишины
+function armSilenceCommit(){
+  clearTimeout(silenceTimer);
+  silenceTimer = setTimeout(async () => {
+    const finalQ = capturedText.trim();
+
+    if (captureMode && finalQ.length > 2) {
+      captureMode = false;
+      capturedText = "";
+
+      setMicStatus("✅ Вопрос зафиксирован. Отправляю…");
+      setQuestionPreview(finalQ);
+
+      await sendFrameWithQuestion(finalQ);
+
+      setTimeout(() => setMicStatus("🎧 Слушаю… скажи: «карты говорите»"), 1200);
+      return;
+    }
+
+    // если тишина наступила, но вопрос пустой — сбрасываем режим
+    captureMode = false;
+    capturedText = "";
+    setQuestionPreview("");
+    setMicStatus("🎧 Слушаю… скажи: «карты говорите»");
+  }, 3000);
+}
+
+function startSpeech(){
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    setMicStatus("❌ SpeechRecognition не поддерживается (лучше Chrome на ноутбуке).");
+    return;
+  }
+
+  // если уже запущено — не запускаем второй раз
+  if (rec) return;
+
+  manualStopSpeech = false;
+  rec = new SR();
+  rec.lang = "ru-RU";
+  rec.continuous = true;
+  rec.interimResults = true;
+
+  rec.onstart = () => setMicStatus("🎧 Слушаю… скажи: «карты говорите»");
+
+  rec.onresult = (e) => {
+    let finalText = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      if (e.results[i].isFinal) finalText += e.results[i][0].transcript + " ";
+    }
+    if (!finalText.trim()) return;
+
+    const norm = normalizeRu(finalText);
+
+    // ждём кодовую фразу
+    if (!captureMode && norm.includes(WAKE_NORM)) {
+      captureMode = true;
+
+      // возьмём хвост после кодовой фразы (если сразу сказала вопрос)
+      const idx = norm.indexOf(WAKE_NORM);
+      const after = norm.slice(idx + WAKE_NORM.length).trim();
+      capturedText = after ? after : "";
+
+      setMicStatus("🎙️ Говори вопрос… (замолчи на 3 секунды — отправлю)");
+      setQuestionPreview(capturedText);
+
+      armSilenceCommit();
+      return;
+    }
+
+    // если в режиме вопроса — копим текст
+    if (captureMode) {
+      capturedText += (capturedText ? " " : "") + finalText.trim();
+      setQuestionPreview(capturedText);
+      armSilenceCommit();
+    }
+  };
+
+  rec.onend = () => {
+    // авто-перезапуск, но только если мы сами не остановили
+    if (!manualStopSpeech) {
+      setTimeout(() => { try { rec.start(); } catch(e) {} }, 400);
+    }
+  };
+
+  rec.onerror = (e) => {
+    setMicStatus("⚠️ Ошибка распознавания: " + (e.error || "unknown"));
+  };
+
+  try { rec.start(); } catch(e) {}
+}
+
+function stopSpeech(){
+  manualStopSpeech = true;
+  try { if (rec) rec.stop(); } catch(e) {}
+  rec = null;
+
+  captureMode = false;
+  capturedText = "";
+  clearTimeout(silenceTimer);
+  setQuestionPreview("");
+  setMicStatus("");
+}
+
+// ===== CAMERA =====
 async function startCam(){
   stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: { ideal: "environment" } }, audio: false
+    video: { facingMode: { ideal: "environment" } },
+    audio: false
   });
   document.getElementById('v').srcObject = stream;
 }
 
-async function sendFrame(){
+function stopCam(){
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+}
+
+async function getFrameBlob(){
   const video = document.getElementById('v');
-  if (!video.videoWidth) return;
+  if (!video.videoWidth || !video.videoHeight) return null;
 
   const canvas = document.createElement('canvas');
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
   canvas.getContext('2d').drawImage(video, 0, 0);
 
-  const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.85));
-  const fd = new FormData();
-  fd.append('image', blob, 'frame.jpg'); // важно: image совпадает с Field Name for Binary Data
-
-  const res = await fetch(WEBHOOK_URL, { method: 'POST', body: fd });
-  const text = await res.text();
-  document.getElementById('out').textContent = `Sent frame: ${new Date().toLocaleTimeString()}\nResponse:\n${text}`;
+  return await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.85));
 }
 
+// отправка кадра (стрим)
+async function sendFrame(){
+  const blob = await getFrameBlob();
+  if (!blob) return;
+
+  const fd = new FormData();
+  fd.append('image', blob, 'frame.jpg');
+
+  try{
+    const res = await fetch(WEBHOOK_URL, { method: 'POST', body: fd });
+    const text = await res.text();
+    document.getElementById('out').textContent =
+      `Sent frame: ${new Date().toLocaleTimeString()}\nResponse:\n${text}`;
+  } catch(e){
+    document.getElementById('out').textContent = `❌ sendFrame error: ${String(e)}`;
+  }
+}
+
+// отправка кадра + вопрос
+async function sendFrameWithQuestion(question){
+  const blob = await getFrameBlob();
+  if (!blob) {
+    document.getElementById('out').textContent = "❌ Камера ещё не дала кадр. Подожди 1–2 секунды после Start.";
+    return;
+  }
+
+  const fd = new FormData();
+  fd.append('image', blob, 'frame.jpg');
+  fd.append('question', question);
+
+  try{
+    const res = await fetch(WEBHOOK_URL, { method: 'POST', body: fd });
+    const text = await res.text();
+    document.getElementById('out').textContent =
+      `🎙 Question sent: ${question}\nResponse:\n${text}`;
+  } catch(e){
+    document.getElementById('out').textContent = `❌ sendFrameWithQuestion error: ${String(e)}`;
+  }
+}
+
+// ===== UI buttons =====
 document.getElementById('start').onclick = async () => {
   await startCam();
+
+  // запускаем микрофон по клику (так надежнее для браузеров)
+  startSpeech();
+
   const ms = Number(document.getElementById('ms').value || 1500);
   clearInterval(timer);
   timer = setInterval(sendFrame, ms);
+
   document.getElementById('out').textContent = "Streaming frames…";
 };
 
 document.getElementById('stop').onclick = () => {
   clearInterval(timer);
-  if (stream) stream.getTracks().forEach(t => t.stop());
+  stopCam();
+  stopSpeech();
   document.getElementById('out').textContent = "Stopped.";
 };
 </script>
+
 </body>
 </html>
